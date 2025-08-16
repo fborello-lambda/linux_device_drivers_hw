@@ -1,0 +1,24 @@
+/dts-v1/;
+/plugin/;
+
+/ {
+    compatible = "brcm,bcm2835";
+
+    fragment@0 {
+        target-path = "/";
+        __overlay__ {
+            sevenseg {
+                compatible = "arg,sevenseg";
+                segment-gpios = <&gpio 24 0>,
+                                <&gpio 23 0>,
+                                <&gpio 20 0>,
+                                <&gpio 21 0>,
+                                <&gpio 22 0>,
+                                <&gpio 25 0>,
+                                <&gpio 19 0>;
+                cathode-gpios = <&gpio 17 1>,
+                                <&gpio 18 1>;
+            };
+        };
+    };
+};
