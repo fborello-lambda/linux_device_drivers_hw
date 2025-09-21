@@ -1,0 +1,19 @@
+/dts-v1/;
+/plugin/;
+
+#include <dt-bindings/interrupt-controller/irq.h>
+
+/ {
+    compatible = "brcm,bcm2835";
+
+    fragment@0 {
+        target-path = "/";
+        __overlay__ {
+            irq-example {
+                compatible = "arg,irq-example";
+                interrupt-parent = <&gpio>;
+                interrupts = <23 IRQ_TYPE_EDGE_FALLING>;
+            };
+        };
+    };
+};
