@@ -8,6 +8,12 @@ Starting from a fresh Raspberry Pi OS installation, follow these steps:
 
 ```sh
 sudo apt update && sudo apt upgrade -y
+sudo reboot
+```
+
+and then:
+
+```sh
 sudo apt install build-essential linux-headers-$(uname -r)
 ```
 
