@@ -6,10 +6,9 @@
 
 Linux Device Drivers are essential to provide integration between the operating system and the device, enabling the hardware and software to work together as intended.
 
-( `WIP` 🚧 ) This project serves as a "guide" or a step-by-step process to get a simple I2C/SPI device working as a Linux Device Driver.
-
 >[!IMPORTANT]
 > This project uses the Raspberry Pi 400, but it can be adapted for other boards if necessary.
+> `uname -r -> 6.12.34+rpt-rpi-v8`
 
 # How
 
