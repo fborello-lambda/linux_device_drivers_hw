@@ -84,6 +84,8 @@ To remove the module and delete the device file:
 >[!IMPORTANT]
 > A Server written in C is provided. [See here](../server_for_mpu6050/c_server/README.md)
 > A Python script is also provided to read and plot the data in real-time. [See here](../server_for_mpu6050/py_client/README.md)
+> For the Python client the server IP must be changed to the Raspberry Pi IP.
+> If VsCode via SSH is used, the port forwarding can be used to access the server.
 
 ## Resources
 
