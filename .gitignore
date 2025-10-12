@@ -2,5 +2,11 @@
 *.ko
 *.mod*
 *.o
+*.pp.dts
 Module.symvers
 modules.order
+
+# For the C server
+*build/
+# For the Python client
+*venv/

@@ -1,0 +1,23 @@
+/dts-v1/;
+/plugin/;
+
+#include <dt-bindings/interrupt-controller/irq.h>
+
+/ {
+    compatible = "brcm,bcm2835";
+
+    fragment@0 {
+        target = <&i2c1>;
+        __overlay__ {
+            #address-cells = <1>;
+            #size-cells = <0>;
+
+            mpu6050: mpu6050@68 {
+                compatible = "arg,kdr_mpu6050";
+                reg = <0x68>;
+                interrupts-extended =   <&gpio 24 IRQ_TYPE_EDGE_FALLING>,
+                                        <&gpio 23 IRQ_TYPE_EDGE_FALLING>;
+            };
+        };
+    };
+};
