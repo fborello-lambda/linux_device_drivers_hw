@@ -1,0 +1,25 @@
+/dts-v1/;
+/plugin/;
+
+#include <dt-bindings/interrupt-controller/irq.h>
+
+/ {
+    compatible = "ti,am335x-bone-black", "ti,am335x-bone", "ti,am33xx";
+
+    fragment@0 {
+        target = <&i2c2>;
+        __overlay__ {
+            #address-cells = <1>;
+            #size-cells = <0>;
+
+            mpu6050: mpu6050@68 {
+                compatible = "arg,kdr_mpu6050";
+                reg = <0x68>;
+                /* P9_23 == gpio1_17, P9_27 == gpio3_21 */
+                /* gpio3_21 is for debugging purposes */
+                interrupts-extended = <&gpio1 17 IRQ_TYPE_EDGE_FALLING>,
+                                    <&gpio3 21 IRQ_TYPE_EDGE_FALLING>;
+            };
+        }; 
+    };
+};
