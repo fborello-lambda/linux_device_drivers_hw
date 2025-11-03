@@ -15,6 +15,8 @@
 #include <stdint.h>
 #include <time.h>
 #include <stdbool.h>
+#include <stdatomic.h>
+#include <sys/epoll.h>
 
 #include "./producer.h"
 
@@ -23,11 +25,10 @@ typedef struct
     int max_connnections;
     int backlog;
     int port;
-    int filter_window_samples;
 } server_config_t;
 
 #define CONFIG_FILE "server_config.cfg"
-#define DEFAULT_SERVER_CONFIG {.max_connnections = 10, .backlog = 5, .port = 3737, .filter_window_samples = 5}
+#define DEFAULT_SERVER_CONFIG {.max_connnections = 10, .backlog = 5, .port = 3737}
 
 static volatile sig_atomic_t running = 1;
 static int sigpipe_fds[2] = {-1, -1};
@@ -35,6 +36,14 @@ static int sigpipe_fds[2] = {-1, -1};
 server_config_t g_server_config;
 shared_data_t *g_shared_data = NULL;
 sem_t *g_sem = NULL;
+static atomic_int g_active_connections = 0;
+
+/* Cleanup handler to decrement the active connection counter when a
+   connection handler thread exits through any code path. */
+static void conn_active_dec_cleanup(void *unused)
+{
+    atomic_fetch_sub(&g_active_connections, 1);
+}
 
 int read_config_from_file(server_config_t *server_config)
 {
@@ -48,8 +57,7 @@ int read_config_from_file(server_config_t *server_config)
     // Read configuration values from the file
     if (fscanf(file, "max_connections=%d\n", &server_config->max_connnections) != 1 ||
         fscanf(file, "backlog=%d\n", &server_config->backlog) != 1 ||
-        fscanf(file, "port=%d\n", &server_config->port) != 1 ||
-        fscanf(file, "filter_window_samples=%d\n", &server_config->filter_window_samples) != 1)
+        fscanf(file, "port=%d\n", &server_config->port) != 1)
     {
         fclose(file);
         return -2;
@@ -61,18 +69,16 @@ int read_config_from_file(server_config_t *server_config)
 
 void handle_signal(int sig)
 {
-    printf("Received signal %d\n", sig);
     switch (sig)
     {
     case SIGUSR2:
         printf("Received SIGUSR2\n");
         read_config_from_file(&g_server_config); // Reload configuration
-        printf("Configuration reloaded: max_connections=%d, filter_window_samples=%d\n",
-               g_server_config.max_connnections, g_server_config.filter_window_samples);
+        printf("Configuration reloaded: max_connections=%d\n",
+               g_server_config.max_connnections);
         break;
     case SIGTERM:
     case SIGINT:
-    default:
         running = 0;
         if (sigpipe_fds[1] != -1)
         {
@@ -80,8 +86,13 @@ void handle_signal(int sig)
             write(sigpipe_fds[1], "x", 1);
         }
         break;
+    case SIGWINCH:
+        break;
+    default:
+        printf("Received signal %d\n", sig);
+        break;
+        return;
     }
-    return;
 }
 
 int init_shared_memory()
@@ -135,8 +146,9 @@ void cleanup_shared_memory()
 
 void *conn_handler(void *arg)
 {
+    pthread_cleanup_push(conn_active_dec_cleanup, NULL);
     if (!arg)
-        return NULL;
+        goto out;
     int client_fd = *(int *)arg;
     free(arg);
 
@@ -146,7 +158,7 @@ void *conn_handler(void *arg)
     if (bytes_read <= 0)
     {
         close(client_fd);
-        return NULL;
+        goto out;
     }
 
     // Parse request line to get the path
@@ -154,23 +166,32 @@ void *conn_handler(void *arg)
     if (sscanf(request, "%15s %255s %15s", method, path, version) != 3)
     {
         close(client_fd);
-        return NULL;
+        goto out;
     }
 
-    mpu6050_sample_float_t local_avg = {0};
+    mpu6050_sample_float_t local_sample, local_avg = {0};
 
     if (g_shared_data && g_sem)
     {
         sem_wait(g_sem);
-        local_avg = g_shared_data->average;
+        local_avg = g_shared_data->buffer[BUFFER_SIZE - 1];
+        local_sample = g_shared_data->current_sample;
         sem_post(g_sem);
     }
 
     char body[512];
     char header[256];
     char avg_str[128];
+    char sample_str[128];
     int body_len, header_len;
 
+    snprintf(sample_str, sizeof(sample_str),
+             "%f,%f,%f, [g]\n"
+             "%f,%f,%f, [dps]\n"
+             "%f, [°C]\n",
+             local_sample.ax, local_sample.ay, local_sample.az,
+             local_sample.gx, local_sample.gy, local_sample.gz,
+             local_sample.temp);
     snprintf(avg_str, sizeof(avg_str),
              "%f,%f,%f, [g]\n"
              "%f,%f,%f, [dps]\n"
@@ -210,20 +231,17 @@ void *conn_handler(void *arg)
     {
         // JSON endpoint
         body_len = snprintf(body, sizeof(body),
-                            "{\n"
-                            "  \"status\": \"ok\",\n"
-                            "  \"ax\": %f,\n"
-                            "  \"ay\": %f,\n"
-                            "  \"az\": %f,\n"
-                            "  \"gx\": %f,\n"
-                            "  \"gy\": %f,\n"
-                            "  \"gz\": %f,\n"
-                            "  \"temp\": %f,\n"
-                            "  \"timestamp\": %ld\n"
-                            "}\n",
+                            "{\"status\":\"ok\","
+                            "\"sample\":{\"ax\":%.6f,\"ay\":%.6f,\"az\":%.6f,\"gx\":%.6f,\"gy\":%.6f,\"gz\":%.6f,\"temp\":%.6f},"
+                            "\"average\":{\"ax\":%.6f,\"ay\":%.6f,\"az\":%.6f,\"gx\":%.6f,\"gy\":%.6f,\"gz\":%.6f,\"temp\":%.6f},"
+                            "\"timestamp\":%ld}",
+                            local_sample.ax, local_sample.ay, local_sample.az,
+                            local_sample.gx, local_sample.gy, local_sample.gz,
+                            local_sample.temp,
                             local_avg.ax, local_avg.ay, local_avg.az,
                             local_avg.gx, local_avg.gy, local_avg.gz,
-                            local_avg.temp, (long)time(NULL));
+                            local_avg.temp,
+                            (long)time(NULL));
 
         header_len = snprintf(header, sizeof(header),
                               "HTTP/1.1 200 OK\r\n"
@@ -235,6 +253,7 @@ void *conn_handler(void *arg)
     }
     else if (strcmp(path, "/events") == 0)
     {
+        // --- Send SSE headers ---
         const char *hdr =
             "HTTP/1.1 200 OK\r\n"
             "Content-Type: text/event-stream; charset=utf-8\r\n"
@@ -243,55 +262,140 @@ void *conn_handler(void *arg)
             "Access-Control-Allow-Origin: *\r\n"
             "X-Accel-Buffering: no\r\n"
             "\r\n";
+
         if (send(client_fd, hdr, strlen(hdr), MSG_NOSIGNAL) <= 0)
         {
+            fprintf(stderr, "[SSE] failed to send header (errno=%d)\n", errno);
             close(client_fd);
-            return NULL;
+            goto out;
         }
-        char json[256];
-        char event[320];
+
+        // 100 ms retry directive
+        const char *retry = "retry: 100\n\n";
+        if (send(client_fd, retry, strlen(retry), MSG_NOSIGNAL) <= 0)
+        {
+            fprintf(stderr, "[SSE] failed to send retry (errno=%d)\n", errno);
+            close(client_fd);
+            goto out;
+        }
+
+        // --- epoll setup for this client ---
+        int epfd = epoll_create1(EPOLL_CLOEXEC);
+        if (epfd < 0)
+        {
+            perror("[SSE] epoll_create1");
+            close(client_fd);
+            goto out;
+        }
+
+        struct epoll_event ev = {0};
+        ev.events = EPOLLIN | EPOLLRDHUP | EPOLLHUP | EPOLLERR;
+        ev.data.fd = client_fd;
+        if (epoll_ctl(epfd, EPOLL_CTL_ADD, client_fd, &ev) < 0)
+        {
+            perror("[SSE] epoll_ctl");
+            close(epfd);
+            close(client_fd);
+            goto out;
+        }
+
+        // --- SSE main loop (send on 1s timeout) || match the retry ---
+        char json[1024];
+        char event[1152];
         int jlen, elen;
-        bool first_event = true;
-        // Optional: suggest client retry delay
-        // Seems to be part of SSE spec
-        const char *retry = "retry: 1000\n\n";
-        (void)send(client_fd, retry, strlen(retry), MSG_NOSIGNAL);
 
         while (running)
         {
-            if (first_event)
+            struct epoll_event rev;
+            int n = epoll_wait(epfd, &rev, 1, 100); // 100ms cadence
+
+            if (n < 0)
             {
-                first_event = false;
-            }
-            else
-            {
-                usleep(1000 * 1000); // 1s
+                if (errno == EINTR)
+                    continue;
+                perror("[SSE] epoll_wait");
+                break;
             }
 
-            if (g_shared_data && g_sem)
+            if (n == 0)
             {
-                sem_wait(g_sem);
-                local_avg = g_shared_data->average;
-                sem_post(g_sem);
+                // Timeout: prepare and send next SSE message
+                if (g_shared_data && g_sem)
+                {
+                    sem_wait(g_sem);
+                    local_sample = g_shared_data->current_sample;
+                    local_avg = g_shared_data->buffer[BUFFER_SIZE - 1];
+                    sem_post(g_sem);
+                }
+
+                jlen = snprintf(json, sizeof(json),
+                                "{\"status\":\"ok\","
+                                "\"sample\":{\"ax\":%.6f,\"ay\":%.6f,\"az\":%.6f,"
+                                "\"gx\":%.6f,\"gy\":%.6f,\"gz\":%.6f,\"temp\":%.6f},"
+                                "\"average\":{\"ax\":%.6f,\"ay\":%.6f,\"az\":%.6f,"
+                                "\"gx\":%.6f,\"gy\":%.6f,\"gz\":%.6f,\"temp\":%.6f},"
+                                "\"timestamp\":%ld}",
+                                local_sample.ax, local_sample.ay, local_sample.az,
+                                local_sample.gx, local_sample.gy, local_sample.gz,
+                                local_sample.temp,
+                                local_avg.ax, local_avg.ay, local_avg.az,
+                                local_avg.gx, local_avg.gy, local_avg.gz,
+                                local_avg.temp,
+                                (long)time(NULL));
+
+                elen = snprintf(event, sizeof(event), "data: %.*s\n\n", jlen, json);
+
+                ssize_t sent = send(client_fd, event, (size_t)elen, MSG_NOSIGNAL);
+                if (sent <= 0)
+                {
+                    fprintf(stderr, "[SSE] send failed (errno=%d)\n", errno);
+                    break;
+                }
+                continue;
             }
-            jlen = snprintf(json, sizeof(json),
-                            "{"
-                            "\"status\":\"ok\","
-                            "\"ax\":%.6f,\"ay\":%.6f,\"az\":%.6f,"
-                            "\"gx\":%.6f,\"gy\":%.6f,\"gz\":%.6f,"
-                            "\"temp\":%.6f,"
-                            "\"timestamp\":%ld"
-                            "}",
-                            local_avg.ax, local_avg.ay, local_avg.az,
-                            local_avg.gx, local_avg.gy, local_avg.gz,
-                            local_avg.temp, (long)time(NULL));
-            elen = snprintf(event, sizeof(event), "data: %.*s\n\n", jlen, json);
-            if (send(client_fd, event, (size_t)elen, MSG_NOSIGNAL) <= 0)
+
+            // n > 0: check events
+            uint32_t e = rev.events;
+            if (e & (EPOLLRDHUP | EPOLLHUP | EPOLLERR))
+            {
+                fprintf(stderr, "[SSE] peer closed or error (events=0x%x)\n", e);
                 break;
+            }
+
+            if (e & EPOLLIN)
+            {
+                // Drain any input and detect EOF
+                char tmp[256];
+                for (;;)
+                {
+                    ssize_t r = recv(client_fd, tmp, sizeof(tmp), MSG_DONTWAIT);
+                    if (r == 0)
+                    {
+                        fprintf(stderr, "[SSE] peer orderly shutdown (EOF)\n");
+                        break;
+                    }
+                    if (r < 0)
+                    {
+                        if (errno == EAGAIN || errno == EWOULDBLOCK)
+                            break;
+                        if (errno == ECONNRESET)
+                        {
+                            fprintf(stderr, "[SSE] connection reset by peer\n");
+                        }
+                        break;
+                    }
+                    if (r < (ssize_t)sizeof(tmp))
+                        break;
+                }
+            }
         }
 
+        fprintf(stderr, "[SSE] exiting SSE loop\n");
+        fflush(stderr);
+        close(epfd);
+        shutdown(client_fd, SHUT_RDWR);
         close(client_fd);
-        return NULL;
+        goto out;
     }
     else
     {
@@ -328,13 +432,15 @@ void *conn_handler(void *arg)
         if (s != header_len)
         {
             close(client_fd);
-            return NULL;
+            goto out;
         }
     }
     if (body_len > 0)
         (void)send(client_fd, body, (size_t)body_len, MSG_NOSIGNAL);
 
     close(client_fd);
+out:
+    pthread_cleanup_pop(1);
     return NULL;
 }
 
@@ -349,9 +455,9 @@ int main()
     else
     {
         printf("Configuration loaded from: %s\n", CONFIG_FILE);
-        printf("max_connections=%d, backlog=%d, port=%d, filter_window_samples=%d\n",
+        printf("max_connections=%d, backlog=%d, port=%d\n",
                g_server_config.max_connnections, g_server_config.backlog,
-               g_server_config.port, g_server_config.filter_window_samples);
+               g_server_config.port);
     }
 
     // Initialize shared memory connection
@@ -482,15 +588,41 @@ int main()
                 continue;
             }
 
-            pthread_t tid;
-            if (pthread_create(&tid, NULL, conn_handler, client_fd) != 0)
+            /* Limit concurrent connections if configured (>0). */
+            atomic_int active_connections = atomic_load(&g_active_connections);
+            if (g_server_config.max_connnections > 0 &&
+                active_connections >= g_server_config.max_connnections)
             {
-                perror("pthread_create");
+                // Reject connection when limit reached
+                printf("Max connections reached: %d/%d, rejecting.\n", active_connections, g_server_config.max_connnections);
                 close(*client_fd);
                 free(client_fd);
                 continue;
             }
-            pthread_detach(tid);
+            else if (g_server_config.max_connnections == 0)
+            {
+                // No connections allowed
+                printf("No connections allowed, rejecting.\n");
+                close(*client_fd);
+                free(client_fd);
+                continue;
+            }
+            else
+            {
+                pthread_t tid;
+                /* Reserve a slot before creating the thread */
+                atomic_fetch_add(&g_active_connections, 1);
+                if (pthread_create(&tid, NULL, conn_handler, client_fd) != 0)
+                {
+                    perror("pthread_create");
+                    /* release reserved slot on failure */
+                    atomic_fetch_sub(&g_active_connections, 1);
+                    close(*client_fd);
+                    free(client_fd);
+                    continue;
+                }
+                pthread_detach(tid);
+            }
         }
     }
 

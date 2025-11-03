@@ -16,7 +16,7 @@
 
 #include "../../06_I2C_w_IRQ_MPU6050/mpu6050_lib.h"
 
-#define BUFFER_SIZE 16
+#define BUFFER_SIZE 128
 #define REFRESH_MS 100
 #define DEVICE "/dev/mpu6050"
 #define SHM_NAME "/data_buffer"
@@ -25,7 +25,7 @@
 typedef struct
 {
     mpu6050_sample_float_t buffer[BUFFER_SIZE];
-    mpu6050_sample_float_t average;
+    mpu6050_sample_float_t current_sample;
     size_t count;
     size_t write_index;
 } shared_data_t;

@@ -160,7 +160,8 @@ int main()
             avg.gz /= shared_data->count;
             avg.temp /= shared_data->count;
         }
-        shared_data->average = avg;
+        shared_data->buffer[BUFFER_SIZE - 1] = avg; // store average in last slot
+        shared_data->current_sample = sample;
 
         sem_post(sem);
 
