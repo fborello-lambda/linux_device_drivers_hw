@@ -18,7 +18,6 @@ int mpu6050_kdd_init(mpu6050_t *dev, mpu6050_config_full_t cfg)
     if (!dev)
         return MPU6050_ERR_BAD_PARAM;
 
-
     // Configure default scales
     dev->accel_scale = cfg.accel_scale;
     dev->gyro_scale = cfg.gyro_scale;
@@ -224,19 +223,19 @@ ssize_t mpu6050_read_fifo_samples(mpu6050_t *dev,
     return frames;
 }
 
-int mpu6050_kdd_whoami(mpu6050_t *dev, __u8 *whoami)
+int mpu6050_kdd_read_byte(mpu6050_t *dev, __u8 *reg_val, unsigned char reg)
 {
     if (!dev)
         return MPU6050_ERR;
 
-    int ret = i2c2_ll_read_byte(dev->i2c_addr, MPU6050_REG_WHO_AM_I);
+    int ret = i2c2_ll_read_byte(dev->i2c_addr, reg);
     if (ret < 0)
     {
-        pr_err("MPU6050: WHOAMI read failed (ret=%d)\n", ret);
+        pr_err("MPU6050: %X read failed (ret=%d)\n", reg, ret);
         return MPU6050_ERR;
     }
-
-    *whoami = (__u8)ret;
+    
+    *reg_val = (__u8)ret;
     return MPU6050_OK;
 }
 

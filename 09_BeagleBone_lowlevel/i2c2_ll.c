@@ -24,6 +24,7 @@
 #include <linux/interrupt.h>
 #include <linux/completion.h>
 #include <linux/mutex.h>
+#include <linux/errno.h>
 #include "i2c2_ll.h"
 
 static void __iomem *cm_per_base;
@@ -200,6 +201,38 @@ static int i2c2_ensure_clk(void)
         udelay(10);
     }
     return -ETIMEDOUT;
+}
+
+static int i2c2_wait_bus_free(const char *tag)
+{
+    int timeout = 4000; /* about 80ms max */
+
+    if (!i2c2_base)
+        return -ENODEV;
+
+    while (timeout-- > 0)
+    {
+        if (!(i2c_r(I2C_IRQSTATUS_RAW) & I2C_IRQ_BB))
+            return 0;
+        udelay(20);
+    }
+
+    pr_err("i2c2_ll: bus busy stuck before %s\n", tag);
+    return -EBUSY;
+}
+
+static void i2c2_force_idle(const char *tag)
+{
+    if (!i2c2_base)
+        return;
+
+    pr_warn("i2c2_ll: forcing idle after %s\n", tag);
+    i2c_w(I2C_CON, 0);
+    udelay(10);
+    i2c_w(I2C_IRQSTATUS, 0xFFFF);
+    g_xfer.phase = I2C2_PHASE_IDLE;
+    i2c_w(I2C_CON, I2C_CON_EN);
+    udelay(10);
 }
 
 /** @brief DEBUG: Dump key I2C2 registers for debugging
@@ -413,6 +446,9 @@ static int i2c2_start_write(__u8 sa, __u8 *buf, __u8 len)
         pr_err("i2c2_ll: write: cannot enable clock: %d\n", rc);
         return rc;
     }
+    rc = i2c2_wait_bus_free("write");
+    if (rc)
+        return rc;
     reinit_completion(&g_xfer.done);
     g_xfer.phase = I2C2_PHASE_WRITE;
     g_xfer.error = 0;
@@ -436,6 +472,7 @@ static int i2c2_start_write(__u8 sa, __u8 *buf, __u8 len)
         i2c2_ll_dump_state("write_timeout");
         /* Clear any sticky IRQ status to avoid poisoning next transfer */
         i2c_w(I2C_IRQSTATUS, 0xFFFF);
+        i2c2_force_idle("write_timeout");
         return -ETIMEDOUT;
     }
     return g_xfer.error;
@@ -461,6 +498,9 @@ static int i2c2_start_read(__u8 sa, __u8 *buf, __u8 len)
         pr_err("i2c2_ll: read: cannot enable clock: %d\n", rc);
         return rc;
     }
+    rc = i2c2_wait_bus_free("read");
+    if (rc)
+        return rc;
     reinit_completion(&g_xfer.done);
     g_xfer.phase = I2C2_PHASE_READ;
     g_xfer.error = 0;
@@ -483,6 +523,7 @@ static int i2c2_start_read(__u8 sa, __u8 *buf, __u8 len)
         pr_err("i2c2_ll: read timeout (sa=0x%02x, len=%u)\n", sa, len);
         i2c2_ll_dump_state("read_timeout");
         i2c_w(I2C_IRQSTATUS, 0xFFFF);
+        i2c2_force_idle("read_timeout");
         return -ETIMEDOUT;
     }
     return (g_xfer.error) ? g_xfer.error : 0;

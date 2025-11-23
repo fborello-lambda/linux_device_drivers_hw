@@ -40,13 +40,14 @@ extern "C"
      */
     int mpu6050_kdd_init(mpu6050_t *dev, mpu6050_config_full_t cfg);
 
-    /** @brief Returns the WHO_AM_I register value.
+    /** @brief Reads a byte from the specified register.
      *
-     * @param dev Pointer to initialized mpu6050_t device structure.
-     * @param whoami Pointer to variable to store the WHO_AM_I value.
+     * @param dev Pointer to mpu6050_t device structure.
+     * @param reg_val Pointer to variable to store the read register value.
+     * @param reg Register address to read from.
      * @return MPU6050_OK on success, negative error code on failure.
      */
-    int mpu6050_kdd_whoami(mpu6050_t *dev, __u8 *whoami);
+    int mpu6050_kdd_read_byte(mpu6050_t *dev, __u8 *reg_val, unsigned char reg);
 
     /** @brief Resets the MPU-6050 device.
      *

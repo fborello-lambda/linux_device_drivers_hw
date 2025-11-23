@@ -6,7 +6,9 @@ set -euo pipefail
 
 MODULE_KO="mpu6050"    # ko filename without .ko
 # Char device node created by platform driver (must match device_create name)
-DEV_NODE="/dev/mpu6050_pdev"
+DEV_NAME="mpu6050_pdev"
+DEV_NODE="/dev/$DEV_NAME"
+CLASS_NODE="/sys/class/$DEV_NAME"
 WAIT_SECS=5
 
 # Using U-BOOT -> To load the overlay we need a reboot.
@@ -96,10 +98,7 @@ mount_module() {
     fi
 
     # reload module
-    if lsmod | awk '{print $1}' | grep -xq "$MODULE_KO"; then
-        echo "📦 Removing existing module $MODULE_KO..."
-        sudo rmmod "$MODULE_KO" || true
-    fi
+    clean_module
 
     echo "📥 Inserting module ${MODULE_KO}.ko ..."
     if ! sudo insmod "${MODULE_KO}.ko"; then
@@ -125,8 +124,6 @@ clean_module() {
     if lsmod | awk '{print $1}' | grep -xq "$MODULE_KO"; then
         echo "📦 Removing module $MODULE_KO..."
         sudo rmmod "$MODULE_KO" || true
-    else
-        echo "ℹ️  Module $MODULE_KO not loaded."
     fi
 
     if [ -e "$DEV_NODE" ]; then
@@ -134,6 +131,13 @@ clean_module() {
         sudo fuser -k "$DEV_NODE" || true
         sleep 0.2
         sudo rm -f "$DEV_NODE" || true
+    fi
+
+    if [ -e "$CLASS_NODE" ]; then
+        echo "⚠️  Removing leftover device node $CLASS_NODE..."
+        sudo fuser -k "$CLASS_NODE" || true
+        sleep 0.2
+        sudo rm -rf "$CLASS_NODE" || true
     fi
 
     echo "✅ Cleanup complete."

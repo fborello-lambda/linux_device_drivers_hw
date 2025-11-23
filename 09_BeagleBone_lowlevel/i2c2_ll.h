@@ -52,6 +52,7 @@
 #define I2C_IRQ_ARDY (1U << 2)
 #define I2C_IRQ_RRDY (1U << 3)
 #define I2C_IRQ_XRDY (1U << 4)
+#define I2C_IRQ_BB (1U << 12)
 #define I2C_IRQ_AAS (1U << 9) // Not used
 
 /* SYSC bits */

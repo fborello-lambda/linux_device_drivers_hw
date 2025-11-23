@@ -12,6 +12,8 @@
 #include <linux/uaccess.h>
 #include <linux/jiffies.h>
 #include <linux/spinlock.h>
+#include <linux/interrupt.h>
+#include <linux/of_irq.h>
 /* MPU6050 primitives */
 #include "mpu6050_kdd_primitives.h"
 /* I2C primitives */
@@ -32,6 +34,9 @@ static struct
     .valid = false,
 };
 
+/* IRQ state */
+static atomic_t g_irq_counter = ATOMIC_INIT(0);
+
 // Global device state
 static mpu6050_t g_mpu6050_dev = {
     .i2c_addr = MPU6050_I2C_ADDR_DEFAULT,
@@ -47,7 +52,7 @@ static int init_mpu6050(void)
 {
     __u8 ret;
     /* Read the chip ID */
-    if (mpu6050_kdd_whoami(&g_mpu6050_dev, &ret) != MPU6050_OK)
+    if (mpu6050_kdd_read_byte(&g_mpu6050_dev, &ret, MPU6050_REG_WHO_AM_I) != MPU6050_OK)
     {
         pr_err("%s: Failed to read WHOAMI register\n", DEV_NAME);
         return -EIO;
@@ -79,6 +84,18 @@ static int remove_mpu6050(void)
     return 0;
 }
 
+/* Thread (sleepable) IRQ handler */
+static irqreturn_t mpu6050_irq_thread(int irq, void *dev_id)
+{
+    unsigned long flags;
+    if (!g_mpu6050_dev.initialized)
+        return IRQ_NONE;
+
+    /* Count IRQ and handle interrupt */
+    atomic_inc(&g_irq_counter);
+    return IRQ_HANDLED;
+}
+
 /* ========== Character device (misc) ========== */
 static ssize_t dev_read(struct file *file, char __user *buf,
                         size_t count, loff_t *ppos)
@@ -89,6 +106,10 @@ static ssize_t dev_read(struct file *file, char __user *buf,
     mpu6050_sample_fixed_t fx;
     bool valid;
     unsigned long flags;
+    u32 local_irq_count;
+
+    /* Capture IRQ count */
+    local_irq_count = atomic_read(&g_irq_counter);
 
     /* Capture MPU6050 sample state */
     spin_lock_irqsave(&g_sample_state.lock, flags);
@@ -102,22 +123,15 @@ static ssize_t dev_read(struct file *file, char __user *buf,
 
     if (!valid)
     {
-        /* On-demand read if no cached sample */
-        __u8 who;
-        if (mpu6050_kdd_whoami(&g_mpu6050_dev, &who) == MPU6050_OK)
-        {
-            pos += scnprintf(kbuf + pos, sizeof(kbuf) - pos,
-                             "WHOAMI: 0x%02x\n(no cached sample)\n", who);
-            pr_info("%s: Detected WHOAMI: 0x%02x\n", DEV_NAME, who);
-        }
-        else
-        {
-            pos += scnprintf(kbuf + pos, sizeof(kbuf) - pos,
-                             "WHOAMI read failed\n");
-        }
+        pos = scnprintf(kbuf, sizeof(kbuf),
+                        "IRQ count: %u\n(no sample yet)\n",
+                        local_irq_count);
     }
     else
     {
+        pos += scnprintf(kbuf + pos, sizeof(kbuf) - pos,
+                         "IRQ count: %u\n", local_irq_count);
+
         pos += mpu6050_kdd_print_msg(kbuf + pos, sizeof(kbuf) - pos, &r, &fx, 0, 1);
     }
 
@@ -155,6 +169,7 @@ static int mpu_platform_probe(struct platform_device *pdev)
     u32 bus_khz;
     struct device_node *child;
     int irq;
+    int irq_mpu;
 
     // POSIBILITY: The register map could be provided by DT.
     if (pdev->dev.of_node)
@@ -181,7 +196,7 @@ static int mpu_platform_probe(struct platform_device *pdev)
         return ret;
     }
 
-    /* Adopt the I2C address from the first compatible child, if provided */
+    /* Adopt the I2C address and IRQ from the first compatible child, if provided */
     if (pdev->dev.of_node)
     {
         for_each_child_of_node(pdev->dev.of_node, child)
@@ -189,8 +204,36 @@ static int mpu_platform_probe(struct platform_device *pdev)
             if (of_device_is_compatible(child, "arg,kdr_mpu6050"))
             {
                 u32 addr;
+
+                /* I2C address from child's reg property (7-bit) */
                 if (!of_property_read_u32(child, "reg", &addr))
                     g_mpu6050_dev.i2c_addr = addr & 0x7f;
+
+                /* obtain the MPU6050 IRQ_PIN from Device Tree (interrupts property) */
+                irq_mpu = of_irq_get(child, 0);
+                if (irq_mpu > 0)
+                {
+                    ret = devm_request_threaded_irq(&pdev->dev,
+                                                    irq_mpu,
+                                                    NULL,               /* no hard handler */
+                                                    mpu6050_irq_thread, /* threaded handler */
+                                                    IRQF_ONESHOT | IRQF_TRIGGER_FALLING,
+                                                    DEV_NAME,
+                                                    pdev);
+                    if (ret)
+                    {
+                        dev_err(&pdev->dev, "Failed to request irq_mpu %d: %d\n", irq_mpu, ret);
+                        of_node_put(child);
+                        return ret;
+                    }
+                    dev_info(&pdev->dev, "Requested MPU6050 IRQ %d\n", irq_mpu);
+                }
+                else
+                {
+                    dev_err(&pdev->dev, "No valid MPU6050 IRQ found in DT (irq=%d)\n", irq_mpu);
+                }
+
+                /* Only use the first matching child */
                 break;
             }
         }
@@ -274,9 +317,8 @@ static void mpu_platform_remove(struct platform_device *pdev)
     remove_mpu6050();
     i2c2_ll_deinit();
 }
-/* Synthetic platform device support (for non-DT boots) */
-static struct platform_device *g_pdev;
 
+/* Platform Driver */
 static struct platform_driver mpu_platform_driver = {
     .probe = mpu_platform_probe,
     .remove = mpu_platform_remove,
@@ -288,32 +330,9 @@ static struct platform_driver mpu_platform_driver = {
 
 static int __init mpu_module_init(void)
 {
-    int ret;
-    struct device_node *np;
-
-    ret = platform_driver_register(&mpu_platform_driver);
+    int ret = platform_driver_register(&mpu_platform_driver);
     if (ret)
         return ret;
-
-    /* Only create the synthetic device if no DT node references us */
-    np = of_find_matching_node(NULL, mpu_of_match);
-    if (!np)
-    {
-        g_pdev = platform_device_register_simple(DEV_NAME, -1, NULL, 0);
-        if (IS_ERR(g_pdev))
-        {
-            ret = PTR_ERR(g_pdev);
-            g_pdev = NULL;
-            pr_err("Failed to register platform device: %d\n", ret);
-            platform_driver_unregister(&mpu_platform_driver);
-            return ret;
-        }
-    }
-    else
-    {
-        of_node_put(np);
-        pr_info("mpu driver: DT node detected, skipping synthetic platform device\n");
-    }
 
     pr_info("mpu driver initialized\n");
     return 0;
@@ -321,11 +340,6 @@ static int __init mpu_module_init(void)
 
 static void __exit mpu_module_exit(void)
 {
-    if (g_pdev)
-    {
-        platform_device_unregister(g_pdev);
-        g_pdev = NULL;
-    }
     platform_driver_unregister(&mpu_platform_driver);
     pr_info("mpu driver exited\n");
 }
