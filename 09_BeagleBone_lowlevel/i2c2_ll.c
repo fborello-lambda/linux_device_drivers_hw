@@ -94,6 +94,7 @@ static irqreturn_t i2c2_ll_irq_handler(int irq, void *dev_id)
         g_xfer.error = (status & I2C_IRQ_NACK) ? -ENXIO : -EAGAIN;
         g_xfer.phase = I2C2_PHASE_IDLE;
         i2c_w(I2C_IRQSTATUS, I2C_IRQ_NACK | I2C_IRQ_AL);
+        // Clears the wait_for_completion
         complete(&g_xfer.done);
         return IRQ_HANDLED;
     }
@@ -132,6 +133,7 @@ static irqreturn_t i2c2_ll_irq_handler(int irq, void *dev_id)
     {
         i2c_w(I2C_IRQSTATUS, I2C_IRQ_ARDY);
         g_xfer.phase = I2C2_PHASE_IDLE;
+        // Clears the wait_for_completion
         complete(&g_xfer.done);
     }
 
@@ -206,9 +208,17 @@ static int i2c2_ensure_clk(void)
 static int i2c2_wait_bus_free(const char *tag)
 {
     int timeout = 4000; /* about 80ms max */
+    int rc;
 
     if (!i2c2_base)
         return -ENODEV;
+
+    rc = i2c2_ensure_clk();
+    if (rc)
+    {
+        pr_err("i2c2_ll: %s: cannot check bus free: %d\n", tag, rc);
+        return rc;
+    }
 
     while (timeout-- > 0)
     {
@@ -223,8 +233,18 @@ static int i2c2_wait_bus_free(const char *tag)
 
 static void i2c2_force_idle(const char *tag)
 {
+    int rc;
+
     if (!i2c2_base)
         return;
+
+    rc = i2c2_ensure_clk();
+    if (rc)
+    {
+        pr_err("i2c2_ll: force_idle(%s): cannot enable clock: %d\n",
+               tag, rc);
+        return;
+    }
 
     pr_warn("i2c2_ll: forcing idle after %s\n", tag);
     i2c_w(I2C_CON, 0);
@@ -426,31 +446,37 @@ bool i2c2_ll_is_initialized(void)
     return g_i2c2_ready;
 }
 
-/** @brief INTERNAL: Start a simple write transfer (len bytes from buf)
- *
- * @param sa Slave address
- * @param buf Buffer containing data to write
- * @param len Number of bytes to write
- *
- * @returns 0 on success, <0 on error
+/* Shared path for read/write transfers: bring the clock up, wait for an idle
+ * bus, prime the simple transfer context, and block until the IRQ handler
+ * finishes or signals an error.
  */
-static int i2c2_start_write(__u8 sa, __u8 *buf, __u8 len)
+static int i2c2_start_transfer(__u8 sa,
+                               __u8 *buf,
+                               __u8 len,
+                               enum i2c2_ll_phase phase,
+                               u16 con_flags,
+                               const char *tag)
 {
     long timeout;
     int rc;
 
-    /* Ensure controller clock is enabled before touching regs */
+    if (!len || !buf)
+        return -EINVAL;
+
     rc = i2c2_ensure_clk();
     if (rc)
     {
-        pr_err("i2c2_ll: write: cannot enable clock: %d\n", rc);
+        pr_err("i2c2_ll: %s: cannot enable clock: %d\n", tag, rc);
         return rc;
     }
-    rc = i2c2_wait_bus_free("write");
+
+    rc = i2c2_wait_bus_free(tag);
     if (rc)
         return rc;
+
+    // The completion structure is used to wait for transfer completion
     reinit_completion(&g_xfer.done);
-    g_xfer.phase = I2C2_PHASE_WRITE;
+    g_xfer.phase = phase;
     g_xfer.error = 0;
     g_xfer.buf = buf;
     g_xfer.len = len;
@@ -459,23 +485,31 @@ static int i2c2_start_write(__u8 sa, __u8 *buf, __u8 len)
     i2c_w(I2C_IRQSTATUS, 0xFFFF);
     i2c_w(I2C_SA, sa);
     i2c_w(I2C_CNT, len);
-    i2c_w(I2C_CON, I2C_CON_EN | I2C_CON_MST | I2C_CON_TRX |
-                       I2C_CON_STT | I2C_CON_STP);
+    i2c_w(I2C_CON, con_flags);
 
-    // https://elixir.bootlin.com/linux/v6.12/source/kernel/sched/completion.c#L152
-    // Same as return wait_for_common(x, timeout, TASK_UNINTERRUPTIBLE);
-    // Setting it as TASK_UNINTERRUPTIBLE when writing data.
     timeout = wait_for_completion_timeout(&g_xfer.done, msecs_to_jiffies(100));
     if (!timeout)
     {
-        pr_err("i2c2_ll: write timeout (sa=0x%02x, len=%u)\n", sa, len);
-        i2c2_ll_dump_state("write_timeout");
-        /* Clear any sticky IRQ status to avoid poisoning next transfer */
+        pr_err("i2c2_ll: %s timeout (sa=0x%02x, len=%u)\n", tag, sa, len);
+        i2c2_ll_dump_state(tag);
         i2c_w(I2C_IRQSTATUS, 0xFFFF);
-        i2c2_force_idle("write_timeout");
+        i2c2_force_idle(tag);
         return -ETIMEDOUT;
     }
+
     return g_xfer.error;
+}
+
+/** @brief INTERNAL: Start a simple write transfer (len bytes from buf) */
+static int i2c2_start_write(__u8 sa, __u8 *buf, __u8 len)
+{
+    return i2c2_start_transfer(sa,
+                               buf,
+                               len,
+                               I2C2_PHASE_WRITE,
+                               I2C_CON_EN | I2C_CON_MST | I2C_CON_TRX |
+                                   I2C_CON_STT | I2C_CON_STP,
+                               "write");
 }
 
 /** @brief INTERNAL: Start a simple read transfer (len bytes into buf)
@@ -488,45 +522,13 @@ static int i2c2_start_write(__u8 sa, __u8 *buf, __u8 len)
  */
 static int i2c2_start_read(__u8 sa, __u8 *buf, __u8 len)
 {
-    long timeout;
-    int rc;
-
-    /* Ensure controller clock is enabled before touching regs */
-    rc = i2c2_ensure_clk();
-    if (rc)
-    {
-        pr_err("i2c2_ll: read: cannot enable clock: %d\n", rc);
-        return rc;
-    }
-    rc = i2c2_wait_bus_free("read");
-    if (rc)
-        return rc;
-    reinit_completion(&g_xfer.done);
-    g_xfer.phase = I2C2_PHASE_READ;
-    g_xfer.error = 0;
-    g_xfer.buf = buf;
-    g_xfer.len = len;
-    g_xfer.idx = 0;
-
-    i2c_w(I2C_IRQSTATUS, 0xFFFF);
-    i2c_w(I2C_SA, sa);
-    i2c_w(I2C_CNT, len);
-    i2c_w(I2C_CON, I2C_CON_EN | I2C_CON_MST |
-                       I2C_CON_STT | I2C_CON_STP);
-
-    // https://elixir.bootlin.com/linux/v6.12/source/kernel/sched/completion.c#L152
-    // Same as return wait_for_common(x, timeout, TASK_UNINTERRUPTIBLE);
-    // Setting it as TASK_UNINTERRUPTIBLE when writing data.
-    timeout = wait_for_completion_timeout(&g_xfer.done, msecs_to_jiffies(100));
-    if (!timeout)
-    {
-        pr_err("i2c2_ll: read timeout (sa=0x%02x, len=%u)\n", sa, len);
-        i2c2_ll_dump_state("read_timeout");
-        i2c_w(I2C_IRQSTATUS, 0xFFFF);
-        i2c2_force_idle("read_timeout");
-        return -ETIMEDOUT;
-    }
-    return (g_xfer.error) ? g_xfer.error : 0;
+    return i2c2_start_transfer(sa,
+                               buf,
+                               len,
+                               I2C2_PHASE_READ,
+                               I2C_CON_EN | I2C_CON_MST |
+                                   I2C_CON_STT | I2C_CON_STP,
+                               "read");
 }
 
 /** @brief Write a single register: write reg address and value

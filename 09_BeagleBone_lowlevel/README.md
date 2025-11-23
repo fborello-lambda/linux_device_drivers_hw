@@ -12,3 +12,35 @@ Also, the driver is set to `TASK_UNINTERRUPTIBLE` state during transfers to avoi
 
 This is done by the function `wait_for_completion_timeout` which internally is the same as:
 `return wait_for_common(x, timeout, TASK_UNINTERRUPTIBLE);` [ref](https://elixir.bootlin.com/linux/v6.12/source/kernel/sched/completion.c#L152).
+
+The `wait_for_completion_timeout` function is used with a `completion` structure to block the calling thread until a specific event occurs or a timeout expires. In this driver, it is used to wait for the completion of I2C data transfers. The interrupt handler signals the completion of the transfer by calling `complete(&g_xfer.done);`, which wakes up the waiting thread. This mechanism ensures that the driver can efficiently wait for I2C operations to finish without busy-waiting, allowing other processes to run in the meantime. Then `reinit_completion(&g_xfer.done);` is called before starting a new transfer to reset the completion structure, preparing it for the next wait operation.
+
+## Comments
+
+Some issues were encountered with clock management.
+
+The output of `dmesg` shows the following messages during initialization and read attempts:
+
+```
+[  314.300085] i2c2_ll: init (bus=100kHz)
+[  314.306284] i2c2_ll: reset timeout, continuing
+[  314.315007] mpu6050_pdev: Detected WHOAMI: 0x68
+[  314.319679] MPU6050: Performing device reset
+[  314.582371] MPU6050: Setting up device with accel scale 0b0000_0000
+[  314.584536] MPU6050: Setting up device with gyro scale 0b0000_0000
+[  314.592994] MPU6050: Setting up device with DLPF config 0b0000_0001
+[  314.603696] MPU6050: Setting up device with sample rate divider 0b0000_0111
+[  314.613848] MPU6050: Setting up device with FIFO enable 0b1111_1000
+[  314.622928] MPU6050: Setting up device with INT pin config 0b1000_0000
+[  314.632502] MPU6050: Setting up device with INT enable 0b0001_0001
+[  314.645059] MPU6050: Setting up device with USER control 0b0100_0000
+[  314.653215] MPU6050: Initialization complete
+[  314.669290] mpu6050_pdev 4819c000.target-module:i2c@0: Requested MPU6050 IRQ 64
+[  314.684335] mpu6050_pdev 4819c000.target-module:i2c@0: char device created (major=240, minor=0)
+[  314.808347] i2c2_ll: read timeout (sa=0x68, len=1)
+[  314.813230] i2c2_ll: dump_state(read): clock gated or module idle, skipping register read
+[  314.821521] i2c2_ll: forcing idle after read
+[  314.825860] i2c2_ll: read_byte failed sa=0x68 reg=0x72 ret=-110
+```
+
+There is a clock issue that sometimes causes timeouts, but it only happens once during initialization. Subsequent reads work fine. The driver includes logic to handle this scenario by forcing the clock on if a timeout occurs, allowing the operation to proceed successfully afterward.
