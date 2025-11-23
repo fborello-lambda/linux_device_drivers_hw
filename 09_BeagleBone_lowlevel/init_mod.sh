@@ -133,13 +133,6 @@ clean_module() {
         sudo rm -f "$DEV_NODE" || true
     fi
 
-    if [ -e "$CLASS_NODE" ]; then
-        echo "⚠️  Removing leftover device node $CLASS_NODE..."
-        sudo fuser -k "$CLASS_NODE" || true
-        sleep 0.2
-        sudo rm -rf "$CLASS_NODE" || true
-    fi
-
     echo "✅ Cleanup complete."
 }
 case "${1:-}" in

@@ -87,12 +87,42 @@ static int remove_mpu6050(void)
 /* Thread (sleepable) IRQ handler */
 static irqreturn_t mpu6050_irq_thread(int irq, void *dev_id)
 {
-    unsigned long flags;
     if (!g_mpu6050_dev.initialized)
         return IRQ_NONE;
 
     /* Count IRQ and handle interrupt */
     atomic_inc(&g_irq_counter);
+
+    unsigned char st;
+    int ret = mpu6050_kdd_read_byte(&g_mpu6050_dev, &st, MPU6050_REG_INT_STATUS);
+    if (ret < 0)
+        return IRQ_HANDLED;
+
+    if (st & MPU6050_INT_STATUS_FIFO_OFLOW)
+    {
+        mpu6050_kdd_reset_fifo(&g_mpu6050_dev);
+        // pr_debug("%s: FIFO overflow -> reset\n", DEV_NAME);
+        return IRQ_HANDLED;
+    }
+
+    if (st & MPU6050_INT_STATUS_DATA_RDY)
+    {
+        // pr_debug("%s: Data ready interrupt\n", DEV_NAME);
+        mpu6050_raw_t fifo_sample;
+        ssize_t n = mpu6050_read_fifo_samples(&g_mpu6050_dev, &fifo_sample, 1);
+        if (n > 0)
+        {
+            mpu6050_sample_fixed_t fx;
+            mpu6050_kdd_raw_to_sample_fixed(&g_mpu6050_dev, &fifo_sample, &fx);
+            /* Publish sample */
+            unsigned long flags;
+            spin_lock_irqsave(&g_sample_state.lock, flags);
+            g_sample_state.raw = fifo_sample; /* struct copy */
+            g_sample_state.fixed = fx;
+            g_sample_state.valid = true;
+            spin_unlock_irqrestore(&g_sample_state.lock, flags);
+        }
+    }
     return IRQ_HANDLED;
 }
 
@@ -158,6 +188,7 @@ struct pdev_char_data
     struct cdev cdev;
     struct class *class;
     struct device *device;
+    int irq_mpu;
 };
 
 /* ======== Platform driver to create char device ======== */
@@ -169,7 +200,7 @@ static int mpu_platform_probe(struct platform_device *pdev)
     u32 bus_khz;
     struct device_node *child;
     int irq;
-    int irq_mpu;
+    int irq_mpu = -1;
 
     // POSIBILITY: The register map could be provided by DT.
     if (pdev->dev.of_node)
@@ -213,24 +244,12 @@ static int mpu_platform_probe(struct platform_device *pdev)
                 irq_mpu = of_irq_get(child, 0);
                 if (irq_mpu > 0)
                 {
-                    ret = devm_request_threaded_irq(&pdev->dev,
-                                                    irq_mpu,
-                                                    NULL,               /* no hard handler */
-                                                    mpu6050_irq_thread, /* threaded handler */
-                                                    IRQF_ONESHOT | IRQF_TRIGGER_FALLING,
-                                                    DEV_NAME,
-                                                    pdev);
-                    if (ret)
-                    {
-                        dev_err(&pdev->dev, "Failed to request irq_mpu %d: %d\n", irq_mpu, ret);
-                        of_node_put(child);
-                        return ret;
-                    }
-                    dev_info(&pdev->dev, "Requested MPU6050 IRQ %d\n", irq_mpu);
+                    /* pdata is allocated below; just record irq_mpu for now and request after pdata exists */
                 }
                 else
                 {
                     dev_err(&pdev->dev, "No valid MPU6050 IRQ found in DT (irq=%d)\n", irq_mpu);
+                    ret = 0;
                 }
 
                 /* Only use the first matching child */
@@ -254,6 +273,9 @@ static int mpu_platform_probe(struct platform_device *pdev)
         i2c2_ll_deinit();
         return -ENOMEM;
     }
+
+    /* initialize pdata fields */
+    pdata->irq_mpu = -1;
 
     /* Allocate device number */
     ret = alloc_chrdev_region(&pdata->devno, 0, 1, DEV_NAME);
@@ -293,6 +315,29 @@ static int mpu_platform_probe(struct platform_device *pdev)
         goto err_class_destroy;
     }
 
+    /*
+    Allocate/request MPU6050 IRQ if provided
+    I was having some issues with devm_request_threaded_irq, so using request_threaded_irq.
+
+    Seems to fix the problem.
+    */
+    if (irq_mpu > 0)
+    {
+        ret = request_threaded_irq(irq_mpu,
+                                   NULL,
+                                   mpu6050_irq_thread,
+                                   IRQF_ONESHOT | IRQF_TRIGGER_FALLING,
+                                   DEV_NAME,
+                                   pdata);
+        if (ret)
+        {
+            dev_err(&pdev->dev, "Failed to request irq_mpu %d: %d\n", irq_mpu, ret);
+            goto err_class_destroy;
+        }
+        pdata->irq_mpu = irq_mpu;
+        dev_info(&pdev->dev, "Requested MPU6050 IRQ %d\n", irq_mpu);
+    }
+
     platform_set_drvdata(pdev, pdata);
     dev_info(&pdev->dev, "char device created (major=%d, minor=%d)\n", MAJOR(pdata->devno), MINOR(pdata->devno));
     return 0;
@@ -313,9 +358,25 @@ static void mpu_platform_remove(struct platform_device *pdev)
     if (!pdata)
         return;
 
-    dev_info(&pdev->dev, "char device removed\n");
+    /* If we requested the MPU IRQ, disable and free it before tearing down other resources */
+    if (pdata->irq_mpu > 0)
+    {
+        disable_irq(pdata->irq_mpu);
+        synchronize_irq(pdata->irq_mpu);
+        free_irq(pdata->irq_mpu, pdata);
+        pdata->irq_mpu = -1;
+    }
+
+    /* Destroy device/node and char dev state */
+    device_destroy(pdata->class, pdata->devno);
+    class_destroy(pdata->class);
+    cdev_del(&pdata->cdev);
+    unregister_chrdev_region(pdata->devno, 1);
+
+    /* Reset sensor and deinitialize I2C low-level controller */
     remove_mpu6050();
     i2c2_ll_deinit();
+    dev_info(&pdev->dev, "Platform device removed\n");
 }
 
 /* Platform Driver */
@@ -328,24 +389,7 @@ static struct platform_driver mpu_platform_driver = {
     },
 };
 
-static int __init mpu_module_init(void)
-{
-    int ret = platform_driver_register(&mpu_platform_driver);
-    if (ret)
-        return ret;
-
-    pr_info("mpu driver initialized\n");
-    return 0;
-}
-
-static void __exit mpu_module_exit(void)
-{
-    platform_driver_unregister(&mpu_platform_driver);
-    pr_info("mpu driver exited\n");
-}
-
-module_init(mpu_module_init);
-module_exit(mpu_module_exit);
+module_platform_driver(mpu_platform_driver);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR(":p");

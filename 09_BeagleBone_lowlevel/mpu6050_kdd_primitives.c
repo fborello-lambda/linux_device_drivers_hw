@@ -141,14 +141,10 @@ static ssize_t mpu6050_read_fifo_bytes(mpu6050_t *dev, u8 *buf, size_t req)
                                  &buf[offset]);
         if (ret < 0)
             return ret;
-        if (ret == 0)
-            break; /* unexpected */
 
-        offset += ret;
-        remaining -= ret;
-
-        if ((size_t)ret != chunk)
-            break; /* short read */
+        /* i2c2_ll_read_block returns 0 on success, so assume full chunk read */
+        offset += chunk;
+        remaining -= chunk;
     }
     return offset;
 }
@@ -173,7 +169,7 @@ ssize_t mpu6050_read_fifo_samples(mpu6050_t *dev,
         return -EINVAL;
 
     rc = mpu6050_kdd_get_fifo_count(dev, &fifo_bytes);
-    pr_debug("MPU6050: FIFO count = %u bytes\n", fifo_bytes);
+    //pr_debug("MPU6050: FIFO count = %u bytes\n", fifo_bytes);
     if (rc < 0)
         return rc;
     if (fifo_bytes < frame)
@@ -191,7 +187,7 @@ ssize_t mpu6050_read_fifo_samples(mpu6050_t *dev,
         return -ENOMEM;
 
     got = mpu6050_read_fifo_bytes(dev, tmp, want_bytes);
-    pr_debug("MPU6050: read %zd bytes from FIFO\n", got);
+    //pr_debug("MPU6050: read %zd bytes from FIFO\n", got);
     if (got < 0)
     {
         kfree(tmp);
@@ -217,7 +213,7 @@ ssize_t mpu6050_read_fifo_samples(mpu6050_t *dev,
         samples[i].gz = (short)get_unaligned_be16(&tmp[off + 12]);
     }
 
-    pr_debug("MPU6050: %u frames converted to samples\n", frames);
+    //pr_debug("MPU6050: %u frames converted to samples\n", frames);
 
     kfree(tmp);
     return frames;
