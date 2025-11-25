@@ -27,6 +27,21 @@ typedef struct
     int port;
 } server_config_t;
 
+/* Cached data protected by mutex + condvar for thread-safe access */
+typedef struct
+{
+    mpu6050_sample_float_t current_sample;
+    mpu6050_sample_float_t average;
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    uint64_t version; /* incremented on each update */
+} cached_data_t;
+
+static cached_data_t g_cached_data = {
+    .mutex = PTHREAD_MUTEX_INITIALIZER,
+    .cond = PTHREAD_COND_INITIALIZER,
+    .version = 0};
+
 #define CONFIG_FILE "server_config.cfg"
 #define DEFAULT_SERVER_CONFIG {.max_connnections = 10, .backlog = 5, .port = 3737}
 
@@ -144,6 +159,74 @@ void cleanup_shared_memory()
     }
 }
 
+/* Data reader thread: reads from shared memory and broadcasts to waiting threads */
+static void *data_reader_thread(void *arg)
+{
+    (void)arg;
+    while (running)
+    {
+        if (g_shared_data && g_sem)
+        {
+            mpu6050_sample_float_t sample, avg;
+
+            sem_wait(g_sem);
+            sample = g_shared_data->current_sample;
+            avg = g_shared_data->buffer[BUFFER_SIZE - 1];
+            sem_post(g_sem);
+
+            pthread_mutex_lock(&g_cached_data.mutex);
+            g_cached_data.current_sample = sample;
+            g_cached_data.average = avg;
+            g_cached_data.version++;
+            pthread_cond_broadcast(&g_cached_data.cond); /* wake all waiting threads */
+            pthread_mutex_unlock(&g_cached_data.mutex);
+        }
+        usleep(REFRESH_MS * 1000); /* match producer refresh rate */
+    }
+    return NULL;
+}
+
+/* Helper: get cached data with mutex protection */
+static void get_cached_data(mpu6050_sample_float_t *sample, mpu6050_sample_float_t *avg)
+{
+    pthread_mutex_lock(&g_cached_data.mutex);
+    if (sample)
+        *sample = g_cached_data.current_sample;
+    if (avg)
+        *avg = g_cached_data.average;
+    pthread_mutex_unlock(&g_cached_data.mutex);
+}
+
+/* Helper: wait for new data (returns new version number) */
+static uint64_t wait_for_new_data(uint64_t last_version, mpu6050_sample_float_t *sample,
+                                  mpu6050_sample_float_t *avg, int timeout_ms)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += timeout_ms / 1000;
+    ts.tv_nsec += (timeout_ms % 1000) * 1000000;
+    if (ts.tv_nsec >= 1000000000)
+    {
+        ts.tv_sec++;
+        ts.tv_nsec -= 1000000000;
+    }
+
+    pthread_mutex_lock(&g_cached_data.mutex);
+    while (g_cached_data.version == last_version && running)
+    {
+        int rc = pthread_cond_timedwait(&g_cached_data.cond, &g_cached_data.mutex, &ts);
+        if (rc == ETIMEDOUT)
+            break;
+    }
+    uint64_t new_version = g_cached_data.version;
+    if (sample)
+        *sample = g_cached_data.current_sample;
+    if (avg)
+        *avg = g_cached_data.average;
+    pthread_mutex_unlock(&g_cached_data.mutex);
+    return new_version;
+}
+
 void *conn_handler(void *arg)
 {
     pthread_cleanup_push(conn_active_dec_cleanup, NULL);
@@ -169,15 +252,10 @@ void *conn_handler(void *arg)
         goto out;
     }
 
-    mpu6050_sample_float_t local_sample, local_avg = {0};
+    mpu6050_sample_float_t local_sample = {0}, local_avg = {0};
 
-    if (g_shared_data && g_sem)
-    {
-        sem_wait(g_sem);
-        local_avg = g_shared_data->buffer[BUFFER_SIZE - 1];
-        local_sample = g_shared_data->current_sample;
-        sem_post(g_sem);
-    }
+    /* Use cached data instead of directly accessing shared memory */
+    get_cached_data(&local_sample, &local_avg);
 
     char body[512];
     char header[256];
@@ -299,15 +377,16 @@ void *conn_handler(void *arg)
             goto out;
         }
 
-        // --- SSE main loop (send on 1s timeout) || match the retry ---
+        // --- SSE main loop: wait for new data via condition variable ---
         char json[1024];
         char event[1152];
         int jlen, elen;
+        uint64_t last_version = 0;
 
         while (running)
         {
             struct epoll_event rev;
-            int n = epoll_wait(epfd, &rev, 1, 100); // 100ms cadence
+            int n = epoll_wait(epfd, &rev, 1, 10); // short poll to check for disconnect
 
             if (n < 0)
             {
@@ -319,14 +398,11 @@ void *conn_handler(void *arg)
 
             if (n == 0)
             {
-                // Timeout: prepare and send next SSE message
-                if (g_shared_data && g_sem)
-                {
-                    sem_wait(g_sem);
-                    local_sample = g_shared_data->current_sample;
-                    local_avg = g_shared_data->buffer[BUFFER_SIZE - 1];
-                    sem_post(g_sem);
-                }
+                /* Wait for new data using condition variable (more efficient than polling) */
+                uint64_t new_version = wait_for_new_data(last_version, &local_sample, &local_avg, 100);
+                if (new_version == last_version)
+                    continue; /* timeout, no new data */
+                last_version = new_version;
 
                 jlen = snprintf(json, sizeof(json),
                                 "{\"status\":\"ok\","
@@ -468,6 +544,16 @@ int main()
     }
 
     printf("Connected to shared memory from producer process\n");
+
+    /* Start data reader thread to cache shared memory data */
+    pthread_t reader_tid;
+    if (pthread_create(&reader_tid, NULL, data_reader_thread, NULL) != 0)
+    {
+        perror("pthread_create data_reader_thread");
+        cleanup_shared_memory();
+        return 1;
+    }
+    pthread_detach(reader_tid);
 
     /**
      * The self-pipe trick is a simple and reliable way to handle signals in a program that uses select() or poll().
